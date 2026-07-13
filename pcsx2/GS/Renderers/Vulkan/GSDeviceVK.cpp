@@ -298,7 +298,7 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs(VkInstance instance)
 					return (std::strcmp(required_extension_name, ext.extensionName) == 0);
 				}) == available_extension_list.end())
 			{
-				Console.Warning(fmt::format("VK: Ignoring GPU '{}' because is is missing required extension {}",
+				Console.Warning(fmt::format("VK: Ignoring GPU '{}' because it is missing required extension {}",
 					props.deviceName, required_extension_name));
 				has_missing_extension = true;
 			}
@@ -1021,16 +1021,18 @@ bool GSDeviceVK::CreateCommandBuffers()
 		}
 		Vulkan::SetObjectName(m_device, resources.fence, "Frame Fence %u", frame_index);
 
-		// Non-push-descriptor path (Mali): per-frame pool for texture descriptor sets, reset wholesale
-		// in ActivateCommandBuffer when the frame is recycled. Sized generously for a heavy frame; if a
-		// frame ever exceeds this, AllocateFrameDescriptorSet logs and the bind is skipped (visual only,
-		// no crash) - this is the tuning knob if a Mali tester reports missing textures.
+		// Non-push-descriptor path (Mali, v3dv): per-frame pool for texture descriptor sets, reset
+		// wholesale in ActivateCommandBuffer when the frame is recycled. Sized generously for a heavy
+		// frame; if a frame ever exceeds this, the call sites execute the command buffer (activating a
+		// freshly reset pool) and retry, mirroring the stream buffer exhaustion handling. Allocation
+		// charges the pool per layout binding, so SAMPLED_IMAGE is 4x (palette/primid + rt/depth when
+		// not input attachments).
 		if (!m_use_push_descriptors)
 		{
 			static constexpr u32 MAX_FRAME_TEXTURE_SETS = 8192;
 			const VkDescriptorPoolSize frame_pool_sizes[] = {
 				{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAME_TEXTURE_SETS * 2},
-				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 3},
+				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 4},
 				{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAME_TEXTURE_SETS * 2},
 				{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAME_TEXTURE_SETS * 2},
 			};
@@ -1209,8 +1211,8 @@ VkDescriptorSet GSDeviceVK::AllocateFrameDescriptorSet(VkDescriptorSetLayout set
 	VkResult res = vkAllocateDescriptorSets(m_device, &allocate_info, &descriptor_set);
 	if (res != VK_SUCCESS)
 	{
-		// Pool exhausted for this frame - skip the bind rather than crash (see pool sizing note).
-		LOG_VULKAN_ERROR(res, "vkAllocateDescriptorSets (frame) failed: ");
+		// Pool exhausted for this frame - not fatal, the caller executes the command buffer
+		// (activating a freshly reset pool) and retries.
 		return VK_NULL_HANDLE;
 	}
 
@@ -5034,13 +5036,24 @@ bool GSDeviceVK::DoCAS(
 	}
 	else
 	{
-		const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_cas_ds_layout);
-		if (ds != VK_NULL_HANDLE)
+		VkDescriptorSet ds = AllocateFrameDescriptorSet(m_cas_ds_layout);
+		if (ds == VK_NULL_HANDLE)
 		{
-			dsub.SetDestinationSet(ds);
-			dsub.Update(m_device, false);
-			vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, 1, &ds, 0, nullptr);
+			// Never dispatch without the set bound - submit this frame's work (activating a freshly
+			// reset pool) and retry. The layout transitions above are already recorded and tracked.
+			ExecuteCommandBuffer(false, "Ran out of CAS descriptors");
+			cmdbuf = GetCurrentCommandBuffer();
+			ds = AllocateFrameDescriptorSet(m_cas_ds_layout);
+			if (ds == VK_NULL_HANDLE)
+			{
+				Console.Error("VK: Failed to allocate CAS descriptor set");
+				return false;
+			}
 		}
+
+		dsub.SetDestinationSet(ds);
+		dsub.Update(m_device, false);
+		vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, 1, &ds, 0, nullptr);
 	}
 
 	// the actual meat and potatoes! only four commands.
@@ -6111,7 +6124,24 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		// in command-buffer state; allocated sets do not). Force all texture sub-flags on. All
 		// m_tfx_textures[] slots are always valid (null slots hold m_null_texture), so this is safe.
 		if (!m_use_push_descriptors)
+		{
 			flags |= DIRTY_FLAG_TFX_TEXTURES;
+
+			// Without ROV the null texture lacks storage usage, so the ROV slots cannot be written
+			// (and no non-ROV pipeline reads them, so leaving them unwritten is fine).
+			if (!m_features.rov)
+				flags &= ~(DIRTY_FLAG_TFX_TEXTURE_RT_ROV | DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV);
+
+			// This rewrites RT/DS bindings the push path would have left untouched, so apply the same
+			// wrong-state sanitization the pipeline layout switch above does.
+			std::array<TFX_TEXTURES, 2> texture_types = { TFX_TEXTURE_RT, TFX_TEXTURE_DEPTH };
+			for (u32 texture_type : texture_types)
+			{
+				const GSTextureVK::Layout tex_layout = m_tfx_textures[texture_type]->GetLayout();
+				if (tex_layout != GSTextureVK::Layout::FeedbackLoop && tex_layout != GSTextureVK::Layout::ShaderReadOnly)
+					m_tfx_textures[texture_type] = m_null_texture.get();
+			}
+		}
 
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_TEX)
 		{
@@ -6173,17 +6203,22 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		else
 		{
 			const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_tfx_texture_ds_layout);
-			if (ds != VK_NULL_HANDLE)
+			if (ds == VK_NULL_HANDLE)
 			{
-				dsub.SetDestinationSet(ds);
-				dsub.Update(m_device);
-				vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout,
-					TFX_DESCRIPTOR_SET_TEXTURES, 1, &ds, 0, nullptr);
+				if (already_execed)
+				{
+					Console.Error("VK: Failed to allocate TFX texture descriptor set");
+					return false;
+				}
+
+				ExecuteCommandBufferAndRestartRenderPass(false, "Ran out of TFX texture descriptors");
+				return ApplyTFXState(true);
 			}
-			else
-			{
-				dsub.Clear();
-			}
+
+			dsub.SetDestinationSet(ds);
+			dsub.Update(m_device);
+			vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout,
+				TFX_DESCRIPTOR_SET_TEXTURES, 1, &ds, 0, nullptr);
 		}
 	}
 
@@ -6214,12 +6249,26 @@ bool GSDeviceVK::ApplyUtilityState(bool already_execed)
 		else
 		{
 			const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_utility_ds_layout);
-			if (ds != VK_NULL_HANDLE)
+			if (ds == VK_NULL_HANDLE)
 			{
-				dsub.SetDestinationSet(ds);
-				dsub.Update(m_device, false);
-				vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_utility_pipeline_layout, 0, 1, &ds, 0, nullptr);
+				if (already_execed)
+				{
+					Console.Error("VK: Failed to allocate utility descriptor set");
+					return false;
+				}
+
+				// Utility draws also happen inside the present pass, which m_current_render_pass
+				// doesn't track - restart the right one (see UploadVertices).
+				if (m_is_presenting)
+					ExecuteCommandBufferAndRestartPresent(false, "Ran out of utility descriptors");
+				else
+					ExecuteCommandBufferAndRestartRenderPass(false, "Ran out of utility descriptors");
+				return ApplyUtilityState(true);
 			}
+
+			dsub.SetDestinationSet(ds);
+			dsub.Update(m_device, false);
+			vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_utility_pipeline_layout, 0, 1, &ds, 0, nullptr);
 		}
 	}
 
