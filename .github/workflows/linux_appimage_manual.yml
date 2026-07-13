@@ -1,0 +1,28 @@
+# Manual Linux-only AppImage build. Lets a work branch (e.g. Raspberry Pi / v3dv
+# testing) produce the arm64 AppImages without dispatching the full build-all
+# matrix (macOS/Windows/Android/iOS). Mirrors build-all.yml's pc-linux-arm64 job.
+name: 🐧 Linux AppImage (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-arm64-appimage:
+    name: PC · Linux arm64 (Qt)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pageVariant: "4k"
+            pageSize: "4096"
+            cacheLineSize: "64"
+          - pageVariant: "16k"
+            pageSize: "16384"
+            cacheLineSize: "128"
+    uses: ./.github/workflows/linux_build_qt.yml
+    with:
+      jobName: "Linux arm64 (${{ matrix.pageVariant }} pages)"
+      artifactPrefixName: "armsx2-linux-arm64-${{ matrix.pageVariant }}-appimage"
+      compiler: clang
+      cmakeflags: "-DHOST_PAGE_SIZE=${{ matrix.pageSize }} -DHOST_CACHE_LINE_SIZE=${{ matrix.cacheLineSize }}"
+      buildAppImage: true
